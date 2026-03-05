@@ -1,0 +1,19 @@
+# Core audio / ML
+librosa
+soundfile
+numpy
+scipy
+scikit-learn
+
+# For the optional Wav2Vec2 emotion model (GPU recommended)
+torch
+transformers
+
+# API server
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+plotly
+openai
+streamlit
