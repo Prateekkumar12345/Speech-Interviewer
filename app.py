@@ -1,3 +1,5 @@
+
+
 """
 AI Interview Prep Pro — Voice-to-Voice Edition
 ================================================
@@ -7,9 +9,6 @@ Flow:
   3. Reply text   → OpenAI TTS   → audio played back
   4. User audio   → Tone Engine  → scores collected silently
   5. End of interview → full tone + interview report shown
-
-Requirements:
-    pip install streamlit openai python-dotenv plotly librosa soundfile numpy scipy
 """
 
 import streamlit as st
@@ -139,12 +138,42 @@ class AcousticExtractor:
 
 
 class BehavioralScorer:
+    # ── Calibrated for real browser/laptop mic recordings ──────────────────
+    # Key fixes vs previous version:
+    #
+    #  jitter:       0.001–0.025 → 0.01–0.08
+    #    Browser mics produce jitter of 0.02–0.06 even for confident speakers
+    #    due to hardware noise. Old upper bound of 0.025 meant everyone maxed out.
+    #
+    #  shimmer:      0.01–0.10  → 0.05–0.25
+    #    Same reason — natural amplitude variation in real speech is 0.08–0.18.
+    #    Old bound of 0.10 treated normal speech as "very shimmery".
+    #
+    #  energy_std:   0.005–0.04 → 0.005–0.08
+    #    Expressive/confident speakers vary volume deliberately (emphasis).
+    #    Old bound of 0.04 penalised natural expressiveness as "unstable".
+    #
+    #  energy_mean:  0.01–0.10  → 0.01–0.07
+    #    Browser mics peak at 0.04–0.06 RMS. Old upper bound of 0.10 made
+    #    even a loud speaker look like they had 50% energy score.
+    #
+    #  hnr:          5–22 dB    → 2–18 dB
+    #    Browser mic HNR is typically 6–14 dB. Old range pushed most
+    #    recordings into the bottom half of the scale.
+    #
+    #  speaking_ratio: 0.40–0.80 → 0.35–0.75  (slightly more lenient floor)
+    # ──────────────────────────────────────────────────────────────────────
     NORMS = {
-        "pitch_std": (15.0, 60.0), "pitch_range": (30.0, 180.0),
-        "speech_rate": (0.35, 0.70), "pause_freq": (0.0, 0.80),
-        "energy_mean": (0.01, 0.10), "energy_std": (0.005, 0.04),
-        "jitter": (0.001, 0.025), "shimmer": (0.01, 0.10),
-        "hnr": (5.0, 22.0), "speaking_ratio": (0.40, 0.80),
+        "pitch_std":      (15.0,  60.0),
+        "pitch_range":    (30.0, 180.0),
+        "speech_rate":    (0.35,  0.70),
+        "pause_freq":     (0.0,   0.70),   # was 0.80
+        "energy_mean":    (0.01,  0.07),   # was 0.10 — browser mics cap here
+        "energy_std":     (0.005, 0.08),   # was 0.04 — allow expressive variation
+        "jitter":         (0.01,  0.08),   # was 0.001–0.025 — mic noise floor
+        "shimmer":        (0.05,  0.25),   # was 0.01–0.10  — real speech range
+        "hnr":            (2.0,   18.0),   # was 5–22 — browser mic reality
+        "speaking_ratio": (0.35,  0.75),   # was 0.40–0.80
     }
 
     def _n(self, v, key):
@@ -154,18 +183,48 @@ class BehavioralScorer:
     def score(self, f: AcousticFeatures):
         n = self._n
         s = BehavioralScores()
-        pv = n(f.pitch_std, "pitch_std");  sr_ = n(f.speech_rate, "speech_rate")
-        pf = n(f.pause_frequency, "pause_freq"); en = n(f.energy_mean, "energy_mean")
-        es = 1 - n(f.energy_std, "energy_std"); jt = n(f.jitter, "jitter")
-        sh = n(f.shimmer, "shimmer");  hn = n(f.hnr, "hnr");  sp = n(f.speaking_ratio, "speaking_ratio")
+        pv  = n(f.pitch_std,        "pitch_std")
+        sr_ = n(f.speech_rate,      "speech_rate")
+        pf  = n(f.pause_frequency,  "pause_freq")
+        en  = n(f.energy_mean,      "energy_mean")
+        es  = 1 - n(f.energy_std,   "energy_std")   # inverted: stable = good
+        jt  = n(f.jitter,           "jitter")
+        sh  = n(f.shimmer,          "shimmer")
+        hn  = n(f.hnr,              "hnr")
+        sp  = n(f.speaking_ratio,   "speaking_ratio")
 
-        conf = 0.25*en + 0.20*sp + 0.20*sr_ + 0.15*hn + 0.10*(1-jt) + 0.10*(1-pf)
+        # ── Confidence ────────────────────────────────────────────────────
+        # Reduced jitter/shimmer weight; they're mic-noise-sensitive.
+        # Increased energy + speaking_ratio weight; these are reliable signals.
+        conf = (0.28*en + 0.22*sp + 0.20*sr_ + 0.15*hn
+                + 0.08*(1-jt) + 0.07*(1-pf))
         s.confidence_score = round(conf * 100, 1)
-        s.anxiety_score    = round((0.30*jt + 0.25*sh + 0.20*pf + 0.15*(1-hn) + 0.10*(1-es)) * 100, 1)
-        s.communication_clarity_score = round((0.35*sr_ + 0.30*hn + 0.20*es + 0.15*(1-pf)) * 100, 1)
-        s.engagement_index = round((0.40*pv + 0.30*sp + 0.30*sr_) * 100, 1)
-        s.fluency_score    = round((0.40*(1-pf) + 0.30*sp + 0.30*(1-jt)) * 100, 1)
-        s.sadness_score    = round((0.30*(1-en) + 0.25*(1-sr_) + 0.20*(1-pv) + 0.15*pf + 0.10*(1-hn)) * 100, 1)
+
+        # ── Anxiety ───────────────────────────────────────────────────────
+        # Reduced jitter (0.30→0.20) and shimmer (0.25→0.15) weights.
+        # Added pause_freq as primary signal (0.20→0.30) — most reliable
+        # nervousness marker that isn't affected by mic quality.
+        anx = (0.30*pf + 0.20*jt + 0.15*sh
+               + 0.20*(1-hn) + 0.15*(1-es))
+        s.anxiety_score = round(anx * 100, 1)
+
+        # ── Clarity ──────────────────────────────────────────────────────
+        clarity = (0.35*sr_ + 0.30*hn + 0.20*es + 0.15*(1-pf))
+        s.communication_clarity_score = round(clarity * 100, 1)
+
+        # ── Engagement ───────────────────────────────────────────────────
+        engage = (0.40*pv + 0.30*sp + 0.30*sr_)
+        s.engagement_index = round(engage * 100, 1)
+
+        # ── Fluency ──────────────────────────────────────────────────────
+        fluency = (0.45*(1-pf) + 0.30*sp + 0.25*(1-jt))
+        s.fluency_score = round(fluency * 100, 1)
+
+        # ── Sadness ──────────────────────────────────────────────────────
+        sadness = (0.30*(1-en) + 0.25*(1-sr_) + 0.20*(1-pv)
+                   + 0.15*pf + 0.10*(1-hn))
+        s.sadness_score = round(sadness * 100, 1)
+
         return s, conf
 
 
@@ -174,39 +233,64 @@ class EmotionClassifier:
         v = {k: 0.0 for k in ["sad","nervous","confident","enthusiastic","calm","disengaged","neutral"]}
         co, ax, sd, eg, fl, cl = (b.confidence_score, b.anxiety_score, b.sadness_score,
                                    b.engagement_index, b.fluency_score, b.communication_clarity_score)
-        if sd > 60:              v["sad"] += 40
-        if f.energy_mean < 0.025: v["sad"] += 20
-        if f.speech_rate < 0.45:  v["sad"] += 15
-        if f.pitch_std < 20 and f.pitch_mean < 180: v["sad"] += 15
-        if f.pause_duration_mean > 0.5: v["sad"] += 10
-        if eg < 30:              v["sad"] += 10
-        if co < 35:              v["sad"] += 10
-        if ax > 60:              v["nervous"] += 40
-        if f.jitter > 0.015:     v["nervous"] += 20
-        if f.shimmer > 0.07:     v["nervous"] += 15
-        if f.pause_frequency > 0.6: v["nervous"] += 15
-        if f.energy_std > 0.025 and f.energy_mean > 0.03: v["nervous"] += 10
-        if co > 65:              v["confident"] += 40
-        if f.energy_mean > 0.05: v["confident"] += 15
-        if f.speech_rate > 0.55: v["confident"] += 15
-        if f.hnr > 14:           v["confident"] += 15
-        if fl > 65:              v["confident"] += 10
-        if ax < 30:              v["confident"] += 5
-        if eg > 70:              v["enthusiastic"] += 35
-        if f.pitch_std > 45:     v["enthusiastic"] += 25
-        if f.energy_mean > 0.07: v["enthusiastic"] += 20
-        if f.speech_rate > 0.60: v["enthusiastic"] += 10
-        if co > 60:              v["enthusiastic"] += 10
-        if co > 50 and ax < 35 and sd < 40: v["calm"] += 30
-        if f.energy_std < 0.012: v["calm"] += 25
-        if 0.45 < f.speech_rate < 0.60: v["calm"] += 20
-        if f.jitter < 0.008:     v["calm"] += 15
-        if cl > 55:              v["calm"] += 10
-        if eg < 25 and co < 35:  v["disengaged"] += 35
-        if f.speaking_ratio < 0.42: v["disengaged"] += 25
-        if f.pitch_std < 15:     v["disengaged"] += 20
-        if f.energy_mean < 0.02: v["disengaged"] += 20
+
+        # ── SAD ──────────────────────────────────────────────────────────────
+        if sd > 60:                                    v["sad"] += 40
+        if f.energy_mean < 0.018:                      v["sad"] += 20
+        if f.speech_rate < 0.42:                       v["sad"] += 15
+        if f.pitch_std < 20 and f.pitch_mean < 170:    v["sad"] += 15
+        if f.pause_duration_mean > 0.6:                v["sad"] += 10
+        if eg < 28:                                    v["sad"] += 10
+        if co < 30:                                    v["sad"] += 10
+
+        # ── NERVOUS ──────────────────────────────────────────────────────────
+        # Raised thresholds: ax > 60 → 68, jitter/shimmer thresholds raised
+        # to not fire on normal browser-mic noise
+        if ax > 68:                                    v["nervous"] += 40
+        if f.jitter > 0.05:                            v["nervous"] += 20   # was 0.015
+        if f.shimmer > 0.18:                           v["nervous"] += 15   # was 0.07
+        if f.pause_frequency > 0.65:                   v["nervous"] += 20   # was 0.6, raised weight
+        if f.energy_std > 0.04 and f.energy_mean > 0.025: v["nervous"] += 10
+        # Prevent nervous if confidence is strong — mutual exclusion
+        if co > 58:                                    v["nervous"] -= 25
+        if fl > 60:                                    v["nervous"] -= 10
+
+        # ── CONFIDENT ────────────────────────────────────────────────────────
+        # Lowered threshold: co > 65 → 52, so mid-range scores still register
+        if co > 52:                                    v["confident"] += 40  # was 65
+        if f.energy_mean > 0.03:                       v["confident"] += 15  # was 0.05
+        if f.speech_rate > 0.50:                       v["confident"] += 15  # was 0.55
+        if f.hnr > 10:                                 v["confident"] += 15  # was 14
+        if fl > 55:                                    v["confident"] += 10  # was 65
+        if ax < 45:                                    v["confident"] += 10  # was 30, wider gate
+        if eg > 45:                                    v["confident"] += 5   # bonus for engagement
+
+        # ── ENTHUSIASTIC ─────────────────────────────────────────────────────
+        if eg > 68:                                    v["enthusiastic"] += 35
+        if f.pitch_std > 42:                           v["enthusiastic"] += 25
+        if f.energy_mean > 0.055:                      v["enthusiastic"] += 20
+        if f.speech_rate > 0.58:                       v["enthusiastic"] += 10
+        if co > 55:                                    v["enthusiastic"] += 10
+
+        # ── CALM ─────────────────────────────────────────────────────────────
+        if co > 45 and ax < 40 and sd < 38:            v["calm"] += 30
+        if f.energy_std < 0.025:                       v["calm"] += 25      # was 0.012 — too strict
+        if 0.42 < f.speech_rate < 0.62:                v["calm"] += 20
+        if f.jitter < 0.035:                           v["calm"] += 15      # was 0.008
+        if cl > 50:                                    v["calm"] += 10
+
+        # ── DISENGAGED ───────────────────────────────────────────────────────
+        if eg < 22 and co < 30:                        v["disengaged"] += 35
+        if f.speaking_ratio < 0.38:                    v["disengaged"] += 25
+        if f.pitch_std < 12:                           v["disengaged"] += 20
+        if f.energy_mean < 0.015:                      v["disengaged"] += 20
+
+        # ── NEUTRAL baseline (always present) ────────────────────────────────
         v["neutral"] += 15
+
+        # Clamp negatives to 0
+        v = {k: max(0.0, val) for k, val in v.items()}
+
         total = sum(v.values()) + 1e-10
         norm = {k: round(val/total*100, 1) for k, val in v.items()}
         return max(norm, key=lambda k: norm[k]), norm
